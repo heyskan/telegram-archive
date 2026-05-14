@@ -64,7 +64,7 @@ jobs:
                       filepath = os.path.join(CONTENT_DIR, filename)
                       with open(filepath, 'wb') as f:
                           f.write(resp.content)
-                      return f"content/{filename}"
+                      return f"telegram/content/{filename}"
               except:
                   pass
               return None
