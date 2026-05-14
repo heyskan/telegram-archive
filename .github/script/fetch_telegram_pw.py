@@ -4,7 +4,6 @@ import time
 import requests
 import hashlib
 import jdatetime
-import re
 from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 
@@ -25,16 +24,40 @@ def save_json(path, data):
     with open(path, 'w') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def download_media(url, channel, msg_id, media_type="image"):
+def is_alarm_content(url):
+    """تشخیص گیف آژیر و محتوای تکراری خبر فوری"""
+    if not url:
+        return True
+    # کلمات کلیدی برای محتوای آژیر و خبر فوری
+    alarm_keywords = ['alarm', 'alert', 'urgent', 'breaking', 'siren', 'warning', 'notification']
+    for keyword in alarm_keywords:
+        if keyword in url.lower():
+            return True
+    # اندازه‌های کوچک (آیکون‌های تکراری)
+    if '100x100' in url or '200x200' in url or '50x50' in url:
+        return True
+    return False
+
+def is_profile_photo(url):
+    """تشخیص عکس پروفایل"""
+    if not url:
+        return True
+    profile_keywords = ['avatar', 'profile', 'user_photo', 'channel_photo', 'photo.jpg']
+    for keyword in profile_keywords:
+        if keyword in url.lower():
+            return True
+    return False
+
+def download_media(url, channel, msg_id):
     if not url:
         return None
     
-    # رد کردن عکس پروفایل و اموجی
-    if any(x in url.lower() for x in ['avatar', 'emoji', 'user_photo', 'thumbnail', 'profile']):
+    # رد کردن عکس پروفایل
+    if is_profile_photo(url):
         return None
     
-    # رد کردن فایل‌های خیلی کوچک (احتمالاً آیکون)
-    if '100x100' in url or '200x200' in url:
+    # رد کردن آژیر و محتوای خبر فوری
+    if is_alarm_content(url):
         return None
     
     try:
@@ -46,32 +69,23 @@ def download_media(url, channel, msg_id, media_type="image"):
         if resp.status_code == 200:
             content_type = resp.headers.get('content-type', '')
             
-            if media_type == "image" and 'image' in content_type:
-                # تعیین پسوند
-                if 'png' in content_type:
-                    ext = 'png'
-                elif 'gif' in content_type:
-                    ext = 'gif'
-                elif 'webp' in content_type:
-                    ext = 'webp'
-                else:
+            if 'image' in content_type:
+                # فقط JPG رو ذخیره کن (فرمت اصلی تلگرام)
+                if 'jpeg' in content_type or 'jpg' in content_type:
                     ext = 'jpg'
+                elif 'png' in content_type:
+                    ext = 'png'
+                else:
+                    return None  # فقط jpg و png قبول کن
                 
                 filename = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.{ext}"
                 filepath = os.path.join(CONTENT_DIR, filename)
                 with open(filepath, 'wb') as f:
                     f.write(resp.content)
                 return f"telegram/content/{filename}"
-            
-            elif media_type == "video" and 'video' in content_type:
-                filename = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.mp4"
-                filepath = os.path.join(CONTENT_DIR, filename)
-                with open(filepath, 'wb') as f:
-                    f.write(resp.content)
-                return f"telegram/content/{filename}"
                 
     except Exception as e:
-        print(f"     خطا در دانلود: {e}")
+        pass
     
     return None
 
@@ -103,59 +117,44 @@ def extract_message_info(element, channel):
         text_elem = element.query_selector('.tgme_widget_message_text')
         text = text_elem.inner_text().strip() if text_elem else ""
         
-        # ========== گرفتن عکس‌ها ==========
+        # ========== گرفتن فقط عکس اصلی پست ==========
         images = []
         
-        # روش 1: عکس‌های با کلاس message_photo
-        for img in element.query_selector_all('.tgme_widget_message_photo img'):
-            src = img.get_attribute('src')
-            if src:
-                downloaded = download_media(src, channel, msg_id, "image")
-                if downloaded:
-                    images.append(downloaded)
+        # روش اصلی: عکس‌های داخل message_photo (عکس اصلی پست)
+        photo_div = element.query_selector('.tgme_widget_message_photo')
+        if photo_div:
+            img = photo_div.query_selector('img')
+            if img:
+                src = img.get_attribute('src')
+                if src:
+                    downloaded = download_media(src, channel, msg_id)
+                    if downloaded:
+                        images.append(downloaded)
         
-        # روش 2: عکس‌های با کلاس message_image
-        for img in element.query_selector_all('.tgme_widget_message_image img'):
-            src = img.get_attribute('src')
-            if src:
-                downloaded = download_media(src, channel, msg_id, "image")
-                if downloaded and downloaded not in images:
-                    images.append(downloaded)
+        # اگر عکس اصلی نبود، روش جایگزین
+        if not images:
+            image_div = element.query_selector('.tgme_widget_message_image')
+            if image_div:
+                img = image_div.query_selector('img')
+                if img:
+                    src = img.get_attribute('src')
+                    if src:
+                        downloaded = download_media(src, channel, msg_id)
+                        if downloaded:
+                            images.append(downloaded)
         
-        # روش 3: همه عکس‌های داخل پیام (به جز عکس پروفایل)
-        for img in element.query_selector_all('img:not(.tgme_widget_message_user_photo)'):
-            src = img.get_attribute('src')
-            if src and 'emoji' not in src:
-                downloaded = download_media(src, channel, msg_id, "image")
-                if downloaded and downloaded not in images:
-                    images.append(downloaded)
-        
-        # روش 4: عکس‌های توی لینک‌های پیش‌نمایش
-        for img in element.query_selector_all('.link_preview_image img'):
-            src = img.get_attribute('src')
-            if src:
-                downloaded = download_media(src, channel, msg_id, "image")
-                if downloaded and downloaded not in images:
-                    images.append(downloaded)
-        
-        # ========== گرفتن ویدیوها ==========
+        # ========== ویدیوها (فقط ویدیوی اصلی، نه آژیر) ==========
         videos = []
         
-        # ویدیوهای مستقیم
-        for video in element.query_selector_all('video'):
-            src = video.get_attribute('src')
-            if src:
-                downloaded = download_media(src, channel, msg_id, "video")
-                if downloaded:
-                    videos.append(downloaded)
-        
-        # لینک ویدیو در src
-        for source in element.query_selector_all('video source'):
-            src = source.get_attribute('src')
-            if src:
-                downloaded = download_media(src, channel, msg_id, "video")
-                if downloaded and downloaded not in videos:
-                    videos.append(downloaded)
+        # فقط ویدیویی که داخل message_video هست (نه آژیرهای تکراری)
+        video_div = element.query_selector('.tgme_widget_message_video')
+        if video_div:
+            video = video_div.query_selector('video')
+            if video:
+                src = video.get_attribute('src')
+                if src and not is_alarm_content(src):
+                    # دانلود ویدیو (اختیاری - می‌تونی غیرفعال کنی)
+                    pass  # فعلاً ویدیو رو دانلود نکن
         
         return {
             'id': msg_id,
@@ -165,7 +164,6 @@ def extract_message_info(element, channel):
             'videos': videos
         }
     except Exception as e:
-        print(f"     خطا در استخراج: {e}")
         return None
 
 def main():
@@ -187,7 +185,7 @@ def main():
                 page.goto(url, timeout=60000, wait_until='networkidle')
                 time.sleep(3)
                 
-                # اسکرول بیشتر برای گرفتن عکس‌ها
+                # اسکرول برای بارگذاری
                 for _ in range(5):
                     page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                     time.sleep(2)
@@ -198,7 +196,6 @@ def main():
                 last_seen = last_ids.get(channel, 0)
                 new_count = 0
                 total_images = 0
-                total_videos = 0
                 
                 for elem in message_elements:
                     msg_info = extract_message_info(elem, channel)
@@ -207,11 +204,10 @@ def main():
                         all_messages.append(msg_info)
                         new_count += 1
                         total_images += len(msg_info['images'])
-                        total_videos += len(msg_info['videos'])
                         if msg_info['id'] > last_ids.get(channel, 0):
                             last_ids[channel] = msg_info['id']
                 
-                print(f"   ✅ {new_count} پیام جدید (عکس: {total_images}, ویدیو: {total_videos})")
+                print(f"   ✅ {new_count} پیام جدید (عکس: {total_images})")
                 save_json(LAST_IDS_FILE, last_ids)
                 
             except Exception as e:
@@ -234,9 +230,6 @@ def main():
             
             for img in msg['images']:
                 f.write(f"![تصویر]({img})\n\n")
-            
-            for vid in msg['videos']:
-                f.write(f"▶️ [ویدیو]({vid})\n\n")
             
             f.write("---\n\n")
     
