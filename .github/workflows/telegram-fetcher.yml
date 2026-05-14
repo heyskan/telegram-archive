@@ -22,13 +22,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip
-          pip install playwright jdatetime requests beautifulsoup4
+          pip install playwright jdatetime requests
           playwright install chromium
 
       - name: اجرای اسکریپت آرشیو
         run: |
           python3 - << 'EOF'
-          import os, json, time, hashlib, requests
+          import os, json, time, hashlib, requests, re
           from playwright.sync_api import sync_playwright
           import jdatetime
           from datetime import datetime, timezone
@@ -51,17 +51,19 @@ jobs:
                   json.dump(data, f, indent=2, ensure_ascii=False)
 
           def download_media(url, channel, msg_id):
-              if not url or 'css' in url or 'emoji' in url:
+              if not url:
                   return None
-              # رد کردن عکس‌های پروفایل
-              if 'photo' in url.lower() or 'avatar' in url.lower() or 'user_photo' in url:
+              # رد کردن عکس‌های پروفایل و اموجی
+              if any(x in url.lower() for x in ['avatar', 'photo', 'emoji', 'user_photo']):
                   return None
               try:
                   resp = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
                   if resp.status_code == 200 and 'image' in resp.headers.get('content-type', ''):
-                      ext = url.split('.')[-1].split('?')[0][:5]
-                      if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
-                          ext = 'jpg'
+                      ext = 'jpg'
+                      if 'png' in resp.headers.get('content-type', ''):
+                          ext = 'png'
+                      elif 'gif' in resp.headers.get('content-type', ''):
+                          ext = 'gif'
                       filename = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.{ext}"
                       filepath = os.path.join(CONTENT_DIR, filename)
                       with open(filepath, 'wb') as f:
@@ -82,6 +84,53 @@ jobs:
               except:
                   return timestamp_str
 
+          def extract_message_info(element, channel):
+              """استخراج اطلاعات از یک پیام"""
+              try:
+                  # گرفتن لینک پیام برای شناسه
+                  link_elem = element.query_selector('a.tgme_widget_message_date')
+                  if not link_elem:
+                      return None
+                  link = link_elem.get_attribute('href')
+                  msg_id = int(link.split('/')[-1]) if link else 0
+                  
+                  # زمان پیام
+                  time_elem = element.query_selector('time')
+                  msg_time = time_elem.get_attribute('datetime') if time_elem else ""
+                  
+                  # متن پیام
+                  text_elem = element.query_selector('.tgme_widget_message_text')
+                  text = text_elem.inner_text().strip() if text_elem else ""
+                  
+                  # عکس‌ها (غیر از عکس پروفایل)
+                  images = []
+                  for img in element.query_selector_all('img'):
+                      src = img.get_attribute('src')
+                      if src and 'emoji' not in src and 'avatar' not in src:
+                          downloaded = download_media(src, channel, msg_id)
+                          if downloaded:
+                              images.append(downloaded)
+                  
+                  # ویدیوها
+                  videos = []
+                  for video in element.query_selector_all('video'):
+                      src = video.get_attribute('src')
+                      if src:
+                          downloaded = download_media(src, channel, msg_id)
+                          if downloaded:
+                              videos.append(downloaded)
+                  
+                  return {
+                      'id': msg_id,
+                      'time': msg_time,
+                      'text': text,
+                      'images': images,
+                      'videos': videos
+                  }
+              except Exception as e:
+                  print(f"     خطا در استخراج: {e}")
+                  return None
+
           with open(CHANNELS_FILE, 'r') as f:
               channels = json.load(f)
 
@@ -90,84 +139,49 @@ jobs:
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              context = browser.new_context(
-                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-              )
-              page = context.new_page()
-
+              page = browser.new_page()
+              
               for channel in channels:
                   print(f"\n📡 پردازش کانال: {channel}")
                   url = f"https://t.me/s/{channel}"
-                  page.goto(url, timeout=60000)
-                  time.sleep(3)
                   
-                  last_seen = last_ids.get(channel, 0)
-                  new_count = 0
-                  
-                  for _ in range(5):
-                      page.mouse.wheel(0, 2000)
-                      time.sleep(1)
-                  
-                  messages = page.query_selector_all('.tgme_widget_message')
-                  
-                  for msg in messages:
-                      try:
-                          msg_id_elem = msg.query_selector('.tgme_widget_message_date time')
-                          if not msg_id_elem:
-                              continue
-                          msg_id_str = msg_id_elem.get_attribute('datetime')
-                          msg_id = int(msg_id_str.replace('-', '').replace('T', '').replace(':', '')[:14])
-                          
-                          if msg_id <= last_seen:
-                              continue
-                              
-                          text_elem = msg.query_selector('.tgme_widget_message_text')
-                          text = text_elem.inner_text() if text_elem else ""
-                          
-                          time_elem = msg.query_selector('.time')
-                          msg_time = time_elem.get_attribute('datetime') if time_elem else ""
-                          
-                          images = []
-                          # گرفتن فقط عکس‌های داخل پیام (کلاس خاص)
-                          for img in msg.query_selector_all('.tgme_widget_message_photo img, .tgme_widget_message_image img'):
-                              src = img.get_attribute('src')
-                              if src:
-                                  downloaded = download_media(src, channel, msg_id)
-                                  if downloaded:
-                                      images.append(downloaded)
-                          
-                          videos = []
-                          for video in msg.query_selector_all('video'):
-                              src = video.get_attribute('src')
-                              if src:
-                                  downloaded = download_media(src, channel, msg_id)
-                                  if downloaded:
-                                      videos.append(downloaded)
-                          
-                          if text or images or videos:
-                              all_messages.append({
-                                  'channel': channel,
-                                  'id': msg_id,
-                                  'time': msg_time,
-                                  'text': text,
-                                  'images': images,
-                                  'videos': videos
-                              })
+                  try:
+                      page.goto(url, timeout=60000, wait_until='networkidle')
+                      time.sleep(3)
+                      
+                      # اسکرول برای بارگذاری بیشتر
+                      for _ in range(3):
+                          page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                          time.sleep(2)
+                      
+                      # گرفتن همه پیام‌ها
+                      message_elements = page.query_selector_all('.tgme_widget_message')
+                      print(f"   تعداد پیام‌های یافت شده: {len(message_elements)}")
+                      
+                      last_seen = last_ids.get(channel, 0)
+                      new_count = 0
+                      
+                      for elem in message_elements:
+                          msg_info = extract_message_info(elem, channel)
+                          if msg_info and msg_info['id'] > last_seen:
+                              msg_info['channel'] = channel
+                              all_messages.append(msg_info)
                               new_count += 1
-                              
-                              if msg_id > last_ids.get(channel, 0):
-                                  last_ids[channel] = msg_id
-                      except Exception as e:
-                          print(f"   خطا: {e}")
-                          continue
-                  
-                  print(f"   ✅ {new_count} پیام جدید")
-                  save_json(LAST_IDS_FILE, last_ids)
+                              if msg_info['id'] > last_ids.get(channel, 0):
+                                  last_ids[channel] = msg_info['id']
+                      
+                      print(f"   ✅ {new_count} پیام جدید دریافت شد")
+                      save_json(LAST_IDS_FILE, last_ids)
+                      
+                  except Exception as e:
+                      print(f"   ❌ خطا در پردازش کانال {channel}: {e}")
               
               browser.close()
 
+          # مرتب‌سازی از جدید به قدیم
           all_messages.sort(key=lambda x: x['id'], reverse=True)
 
+          # نوشتن فایل مارک‌داون
           with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
               f.write("# 📡 آرشیو خودکار کانال‌های تلگرام\n\n")
               f.write(f"آخرین به‌روزرسانی: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
@@ -188,6 +202,7 @@ jobs:
                   f.write("---\n\n")
 
           print(f"\n✅ آرشیو ذخیره شد: {OUTPUT_FILE}")
+          print(f"📊 مجموع پیام‌ها: {len(all_messages)}")
           EOF
 
       - name: Commit و Push
