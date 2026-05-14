@@ -21,37 +21,162 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: pip install playwright requests jdatetime
 
-      - name: Install Chromium for Playwright
+      - name: Install Chromium
         run: |
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
-      - name: Run archiver
-        run: python .github/script/fetch_telegram_pw.py
+      - name: Run Telegram archiver
+        run: |
+          python3 << 'EOF'
+          import os, json, time, requests, hashlib, jdatetime, re
+          from datetime import datetime, timezone
+          from playwright.sync_api import sync_playwright
 
-      - name: Commit and push changes
+          CHANNELS_FILE = "telegram/channels.json"
+          OUTPUT_FILE = "telegram.md"
+          CONTENT_DIR = "telegram/content"
+          LAST_IDS_FILE = "telegram/last_ids.json"
+          os.makedirs(CONTENT_DIR, exist_ok=True)
+
+          def load_json(p, d=None):
+              if os.path.exists(p):
+                  with open(p, 'r') as f: return json.load(f)
+              return d if d is not None else {}
+
+          def save_json(p, data):
+              with open(p, 'w') as f: json.dump(data, f, indent=2, ensure_ascii=False)
+
+          def download_media(url, channel, msg_id):
+              if not url: return None
+              u = url.lower()
+              # رد کردن عکس پروفایل، اموجی، آژیر
+              if any(x in u for x in ['user_photo', 'avatar', 'emoji', 'alarm', 'alert', 'siren', 'breaking']):
+                  return None
+              if 'photo.jpg' in u and '100x100' in u: return None
+              try:
+                  h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                  r = requests.get(url, timeout=30, headers=h)
+                  if r.status_code == 200:
+                      ct = r.headers.get('content-type', '')
+                      if 'image' in ct:
+                          ext = 'jpg'
+                          if 'png' in ct: ext = 'png'
+                          elif 'gif' in ct: ext = 'gif'
+                          elif 'webp' in ct: ext = 'webp'
+                          name = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.{ext}"
+                          path = os.path.join(CONTENT_DIR, name)
+                          with open(path, 'wb') as f: f.write(r.content)
+                          return f"telegram/content/{name}"
+                      elif 'video' in ct:
+                          name = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.mp4"
+                          path = os.path.join(CONTENT_DIR, name)
+                          with open(path, 'wb') as f: f.write(r.content)
+                          return f"telegram/content/{name}"
+              except: pass
+              return None
+
+          def convert_time(ts):
+              try:
+                  if 'T' in ts: dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                  else: dt = datetime.strptime(ts, "%d %b %Y at %H:%M")
+                  jd = jdatetime.datetime.fromgregorian(datetime=dt)
+                  return f"{jd.year}/{jd.month}/{jd.day} - {jd.hour:02d}:{jd.minute:02d}"
+              except: return ts
+
+          with open(CHANNELS_FILE, 'r') as f: channels = json.load(f)
+          last_ids = load_json(LAST_IDS_FILE, {})
+          all_messages = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+              for ch in channels:
+                  print(f"\n📡 {ch}")
+                  url = f"https://t.me/s/{ch}"
+                  try:
+                      page.goto(url, timeout=60000, wait_until='networkidle')
+                      time.sleep(3)
+                      for _ in range(4):
+                          page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                          time.sleep(2)
+                      msgs = page.query_selector_all('.tgme_widget_message')
+                      print(f"   پیام‌ها: {len(msgs)}")
+                      last_seen = last_ids.get(ch, 0)
+                      new_cnt = 0
+                      for el in msgs:
+                          link_el = el.query_selector('a.tgme_widget_message_date')
+                          if not link_el: continue
+                          link = link_el.get_attribute('href')
+                          msg_id = int(link.split('/')[-1]) if link else 0
+                          if msg_id <= last_seen: continue
+                          time_el = el.query_selector('time')
+                          msg_time = time_el.get_attribute('datetime') if time_el else ""
+                          text_el = el.query_selector('.tgme_widget_message_text')
+                          text = text_el.inner_text().strip() if text_el else ""
+                          images = []
+                          # عکس اصلی: اولویت با .tgme_widget_message_photo
+                          photo_div = el.query_selector('.tgme_widget_message_photo')
+                          if photo_div:
+                              img = photo_div.query_selector('img')
+                              if img:
+                                  src = img.get_attribute('src')
+                                  if src:
+                                      dl = download_media(src, ch, msg_id)
+                                      if dl: images.append(dl)
+                          # اگه عکس اصلی نبود، هر عکس دیگه‌ای (به جز پروفایل)
+                          if not images:
+                              for img in el.query_selector_all('img'):
+                                  src = img.get_attribute('src')
+                                  if src and 'user_photo' not in src and 'emoji' not in src:
+                                      dl = download_media(src, ch, msg_id)
+                                      if dl and dl not in images: images.append(dl)
+                          videos = []
+                          for vid in el.query_selector_all('video'):
+                              src = vid.get_attribute('src')
+                              if src:
+                                  dl = download_media(src, ch, msg_id)
+                                  if dl: videos.append(dl)
+                          all_messages.append({'channel': ch, 'id': msg_id, 'time': msg_time, 'text': text, 'images': images, 'videos': videos})
+                          new_cnt += 1
+                          if msg_id > last_ids.get(ch, 0): last_ids[ch] = msg_id
+                      print(f"   ✅ {new_cnt} جدید (عکس: {sum(len(m['images']) for m in all_messages if m['channel']==ch)})")
+                      save_json(LAST_IDS_FILE, last_ids)
+                  except Exception as e: print(f"   ❌ {e}")
+              browser.close()
+
+          all_messages.sort(key=lambda x: x['id'], reverse=True)
+          with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+              f.write("# 📡 آرشیو خودکار کانال‌های تلگرام\n\n")
+              f.write(f"آخرین به‌روزرسانی: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
+              for m in all_messages:
+                  f.write(f"## 📌 {m['channel']}\n")
+                  f.write(f"**زمان:** {convert_time(m['time'])} | **شناسه:** {m['id']}\n\n")
+                  if m['text']: f.write(f"{m['text']}\n\n")
+                  for img in m['images']: f.write(f"![تصویر]({img})\n\n")
+                  for vid in m['videos']: f.write(f"▶️ [ویدیو]({vid})\n\n")
+                  f.write("---\n\n")
+          print(f"\n✅ ذخیره شد: {OUTPUT_FILE} - {len(all_messages)} پیام")
+          EOF
+
+      - name: Commit and push
         env:
           BRANCH: ${{ github.ref_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 524288000
-
           if [ -d telegram/content ]; then git add telegram/content/; fi
-          git add telegram/last_ids.json telegram.md
-
+          git add telegram/last_ids.json telegram.md || true
           if git diff --staged --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-
           git commit -m "Update Telegram messages [skip ci]"
-
-          RETRIES=5
-          for i in $(seq 1 $RETRIES); do
+          for i in 1 2 3 4 5; do
             echo "Push attempt $i..."
             git pull --rebase --autostash origin "$BRANCH"
             if git push origin "$BRANCH"; then
@@ -59,6 +184,6 @@ jobs:
               break
             else
               echo "Push failed."
-              [ $i -lt $RETRIES ] && sleep 3 || exit 1
+              [ $i -lt 5 ] && sleep 3 || exit 1
             fi
           done
