@@ -51,14 +51,37 @@ jobs:
               with open(path, 'w') as f:
                   json.dump(data, f, indent=2, ensure_ascii=False)
 
-          def download_media(url, channel, msg_id):
+          def is_profile_photo(url, channel):
+              """تشخیص عکس پروفایل کانال"""
+              if not url:
+                  return True
+              # عکس پروفایل معمولاً شامل این الگوهاست
+              patterns = ['photo', 'avatar', 'profile', 'channel_photo']
+              for pattern in patterns:
+                  if pattern in url.lower():
+                      return True
+              # عکس‌های کوچک (100x100) معمولاً پروفایل هستند
+              if '100x100' in url or '200x200' in url:
+                  return True
+              return False
+
+          def download_media(url, channel, msg_id, is_message_content=True):
               if not url or 'css' in url:
                   return None
+              
+              # اگر عکس پروفایل است و داخل پیام نیست، رد کن
+              if is_profile_photo(url, channel) and not is_message_content:
+                  return None
+                  
               try:
                   resp = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
                   if resp.status_code == 200:
+                      content_type = resp.headers.get('content-type', '')
+                      if 'image' not in content_type:
+                          return None
+                          
                       ext = url.split('.')[-1].split('?')[0][:5]
-                      if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'pdf']:
+                      if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
                           ext = 'jpg'
                       filename = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.{ext}"
                       filepath = os.path.join(CONTENT_DIR, filename)
@@ -102,6 +125,7 @@ jobs:
                   last_seen = last_ids.get(channel, 0)
                   new_count = 0
                   
+                  # اسکرول برای دریافت پیام‌های بیشتر
                   for _ in range(5):
                       page.mouse.wheel(0, 2000)
                       time.sleep(1)
@@ -122,19 +146,31 @@ jobs:
                           time_elem = msg.query_selector('.time')
                           msg_time = time_elem.get_attribute('datetime') if time_elem else ""
                           
+                          # دریافت عکس‌های داخل پیام (نه عکس پروفایل)
                           images = []
-                          for img in msg.query_selector_all('img'):
+                          # عکس‌هایی که کلاس عکس پیام دارند
+                          for img in msg.query_selector_all('.tgme_widget_message_photo img, .tgme_widget_message_image img, .link_preview_image img'):
                               src = img.get_attribute('src')
                               if src and 'emoji' not in src:
-                                  downloaded = download_media(src, channel, msg_id)
+                                  downloaded = download_media(src, channel, msg_id, is_message_content=True)
                                   if downloaded:
                                       images.append(downloaded)
+                          
+                          # همچنین عکس‌های با کلاس کلی
+                          for img in msg.query_selector_all('img:not(.tgme_widget_message_user_photo)'):
+                              src = img.get_attribute('src')
+                              if src and 'emoji' not in src:
+                                  # چک نکن که عکس پروفایل نباشد
+                                  if 'user_photo' not in src and 'avatar' not in src:
+                                      downloaded = download_media(src, channel, msg_id, is_message_content=True)
+                                      if downloaded and downloaded not in images:
+                                          images.append(downloaded)
                           
                           videos = []
                           for video in msg.query_selector_all('video'):
                               src = video.get_attribute('src')
                               if src:
-                                  downloaded = download_media(src, channel, msg_id)
+                                  downloaded = download_media(src, channel, msg_id, is_message_content=True)
                                   if downloaded:
                                       videos.append(downloaded)
                           
@@ -150,10 +186,11 @@ jobs:
                           
                           if msg_id > last_ids.get(channel, 0):
                               last_ids[channel] = msg_id
-                      except:
+                      except Exception as e:
+                          print(f"   خطا در پردازش پیام: {e}")
                           continue
                   
-                  print(f"   ✅ {new_count} پیام جدید")
+                  print(f"   ✅ {new_count} پیام جدید با {sum(len(m['images']) for m in all_messages if m['channel']==channel)} عکس")
                   save_json(LAST_IDS_FILE, last_ids)
               
               browser.close()
@@ -185,7 +222,7 @@ jobs:
       - name: Commit و Push
         run: |
           git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git config.user.email "github-actions@github.com"
           git add telegram.md telegram/content/ telegram/last_ids.json || true
           git diff --cached --quiet || git commit -m "به‌روزرسانی خودکار آرشیو تلگرام [skip ci]"
           git push origin main || git push origin master
