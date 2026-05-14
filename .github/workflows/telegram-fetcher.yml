@@ -32,7 +32,7 @@ jobs:
       - name: Run Telegram archiver
         run: |
           python3 << 'EOF'
-          import os, json, time, requests, hashlib, jdatetime, re
+          import os, json, time, requests, hashlib, jdatetime
           from datetime import datetime, timezone
           from playwright.sync_api import sync_playwright
 
@@ -50,33 +50,61 @@ jobs:
           def save_json(p, data):
               with open(p, 'w') as f: json.dump(data, f, indent=2, ensure_ascii=False)
 
-          def download_media(url, channel, msg_id):
-              if not url: return None
+          def is_alarm_gif(url):
+              """تشخیص گیف آژیر و خبر فوری"""
+              if not url:
+                  return True
               u = url.lower()
-              # رد کردن عکس پروفایل، اموجی، آژیر
-              if any(x in u for x in ['user_photo', 'avatar', 'emoji', 'alarm', 'alert', 'siren', 'breaking']):
+              # کلمات کلیدی آژیر
+              alarm_keywords = ['alarm', 'alert', 'siren', 'urgent', 'breaking', 'warning', 'notification', 'gif']
+              for kw in alarm_keywords:
+                  if kw in u:
+                      return True
+              # لینک‌های خاص آژیر
+              if 'cdn5' in u and 'telegram' in u and 'gif' in u:
+                  return True
+              return False
+
+          def download_media(url, channel, msg_id):
+              if not url:
                   return None
-              if 'photo.jpg' in u and '100x100' in u: return None
+              
+              u = url.lower()
+              
+              # رد کردن عکس پروفایل (user_photo)
+              if 'user_photo' in u:
+                  return None
+              
+              # رد کردن آژیر و گیف‌های خبر فوری
+              if is_alarm_gif(url):
+                  return None
+              
+              # رد کردن اموجی
+              if 'emoji' in u:
+                  return None
+              
               try:
                   h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                   r = requests.get(url, timeout=30, headers=h)
                   if r.status_code == 200:
                       ct = r.headers.get('content-type', '')
-                      if 'image' in ct:
-                          ext = 'jpg'
-                          if 'png' in ct: ext = 'png'
-                          elif 'gif' in ct: ext = 'gif'
-                          elif 'webp' in ct: ext = 'webp'
-                          name = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.{ext}"
+                      
+                      # فقط عکس با فرمت JPG (فرمت اصلی عکس‌های تلگرام)
+                      if 'image' in ct and 'jpeg' in ct:
+                          name = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.jpg"
                           path = os.path.join(CONTENT_DIR, name)
                           with open(path, 'wb') as f: f.write(r.content)
                           return f"telegram/content/{name}"
-                      elif 'video' in ct:
+                      
+                      # ویدیو (اختیاری - میخوای؟)
+                      elif 'video' in ct and 'mp4' in ct:
                           name = f"{channel}_{msg_id}_{hashlib.md5(url.encode()).hexdigest()[:8]}.mp4"
                           path = os.path.join(CONTENT_DIR, name)
                           with open(path, 'wb') as f: f.write(r.content)
                           return f"telegram/content/{name}"
-              except: pass
+                          
+              except Exception as e:
+                  pass
               return None
 
           def convert_time(ts):
@@ -95,7 +123,7 @@ jobs:
               browser = p.chromium.launch(headless=True)
               page = browser.new_page()
               for ch in channels:
-                  print(f"\n📡 {ch}")
+                  print(f"\n📡 کانال: {ch}")
                   url = f"https://t.me/s/{ch}"
                   try:
                       page.goto(url, timeout=60000, wait_until='networkidle')
@@ -104,7 +132,7 @@ jobs:
                           page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                           time.sleep(2)
                       msgs = page.query_selector_all('.tgme_widget_message')
-                      print(f"   پیام‌ها: {len(msgs)}")
+                      print(f"   تعداد پیام‌ها: {len(msgs)}")
                       last_seen = last_ids.get(ch, 0)
                       new_cnt = 0
                       for el in msgs:
@@ -117,35 +145,36 @@ jobs:
                           msg_time = time_el.get_attribute('datetime') if time_el else ""
                           text_el = el.query_selector('.tgme_widget_message_text')
                           text = text_el.inner_text().strip() if text_el else ""
+                          
+                          # فقط عکس اصلی پست (اولین عکس غیر از پروفایل)
                           images = []
-                          # عکس اصلی: اولویت با .tgme_widget_message_photo
                           photo_div = el.query_selector('.tgme_widget_message_photo')
                           if photo_div:
                               img = photo_div.query_selector('img')
                               if img:
                                   src = img.get_attribute('src')
-                                  if src:
+                                  if src and 'user_photo' not in src:
                                       dl = download_media(src, ch, msg_id)
-                                      if dl: images.append(dl)
-                          # اگه عکس اصلی نبود، هر عکس دیگه‌ای (به جز پروفایل)
-                          if not images:
-                              for img in el.query_selector_all('img'):
-                                  src = img.get_attribute('src')
-                                  if src and 'user_photo' not in src and 'emoji' not in src:
-                                      dl = download_media(src, ch, msg_id)
-                                      if dl and dl not in images: images.append(dl)
+                                      if dl:
+                                          images.append(dl)
+                          
+                          # ویدیوها
                           videos = []
                           for vid in el.query_selector_all('video'):
                               src = vid.get_attribute('src')
                               if src:
                                   dl = download_media(src, ch, msg_id)
                                   if dl: videos.append(dl)
-                          all_messages.append({'channel': ch, 'id': msg_id, 'time': msg_time, 'text': text, 'images': images, 'videos': videos})
+                          
+                          all_messages.append({
+                              'channel': ch, 'id': msg_id, 'time': msg_time,
+                              'text': text, 'images': images, 'videos': videos
+                          })
                           new_cnt += 1
                           if msg_id > last_ids.get(ch, 0): last_ids[ch] = msg_id
-                      print(f"   ✅ {new_cnt} جدید (عکس: {sum(len(m['images']) for m in all_messages if m['channel']==ch)})")
+                      print(f"   ✅ {new_cnt} پیام جدید (عکس: {sum(len(m['images']) for m in all_messages if m['channel']==ch)})")
                       save_json(LAST_IDS_FILE, last_ids)
-                  except Exception as e: print(f"   ❌ {e}")
+                  except Exception as e: print(f"   ❌ خطا: {e}")
               browser.close()
 
           all_messages.sort(key=lambda x: x['id'], reverse=True)
